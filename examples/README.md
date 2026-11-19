@@ -45,6 +45,16 @@ docker compose up -d --build
 
 提示：worker 默认很快，20000 样本可能几秒内跑完；用 `RUN_CHUNK_DELAY_MS=100 docker compose up -d` 让中断窗口清晰可见。若脚本提示"run completed before restart"，按此调整即可。
 
+## 04 · 覆盖回执 / 样本核验（`04_coverage_receipts.sh`）
+
+时间线（`T = 2026-11-15T12:00:00Z`，核验窗口 `[T-24h, T)`）：
+
+1. 导入样本 `s1(A@T)`、`s2(B@T)` 与回执 `data/coverage_receipts.csv`：A 覆盖 `[T-36h,T-3h)` 与 `[T-2h,T)`，缺 `[T-3h,T-2h)`；B 全覆盖。
+2. 创建覆盖报告：`s1` 未完整覆盖，未覆盖区间 `[09:00Z,10:00Z)`；`s2` 完整覆盖。
+3. 导入迟到回执 `data/coverage_receipts_late.csv`（撤销 `crc-2`）：旧报告被标记 `is_stale=true`，但**原结论仍可查看**。
+4. 新建报告 2：`s1` 缺口扩大为 `[09:00Z,12:00Z)`。
+5. 原样重传 `coverage_receipts.csv` → `rows_inserted=0`，**不会**再使报告过期。
+
 ## 数据文件
 
 | 文件 | 内容 |
@@ -53,3 +63,5 @@ docker compose up -d --build
 | `data/revisions_late.csv` | 5 条迟到修订（更正账户/时刻、撤销、晚到、回填） |
 | `data/revisions_conflict.csv` | 与既有 `p1#1` 内容冲突的批次（含一条新行 p9，用于证明整批回滚） |
 | `data/samples_1.csv` / `data/samples_2.csv` | 示例 01 的样本 |
+| `data/coverage_receipts.csv` | 覆盖回执（A 有缺口、B 全覆盖） |
+| `data/coverage_receipts_late.csv` | 撤销 `crc-2` 的迟到回执修订 |

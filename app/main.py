@@ -1,4 +1,4 @@
-"""FastAPI application: payment-revision intake, sample intake, training runs."""
+"""FastAPI application: payment/sample/coverage intake, training runs, coverage reports."""
 
 from __future__ import annotations
 
@@ -14,13 +14,31 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .csvio import CsvError, parse_revision_csv, parse_sample_csv
+from .coverage import (
+    MAX_REPORT_SAMPLES,
+    MissingSamplesError,
+    NoReceiptsError,
+    NoSamplesError,
+    CoverageRequestError,
+    covered_count,
+    create_report,
+    report_items,
+    report_row,
+    report_summary,
+)
+from .csvio import (
+    CsvError,
+    parse_coverage_csv,
+    parse_revision_csv,
+    parse_sample_csv,
+)
 from .db import create_pool, init_schema
 from .imports import (
     ACCEPTANCE_LOCK_KEY,
     ConflictError,
+    import_coverage_batch,
     import_revision_batch,
     import_sample_batch,
 )
@@ -65,6 +83,105 @@ class RunStatus(BaseModel):
     error: Optional[str]
 
 
+class CoverageBatchResult(BatchResult):
+    reports_marked_stale: int
+
+
+class CoverageRange(BaseModel):
+    from_utc: datetime
+    to_utc: datetime
+
+
+class CoverageReportItem(BaseModel):
+    sample_id: str
+    account_id: str
+    prediction_at_utc: datetime
+    window_from_utc: datetime
+    window_to_utc: datetime
+    fully_covered: bool
+    uncovered_ranges: list[CoverageRange]
+
+
+class CoverageReportSummary(BaseModel):
+    report_id: int
+    created_at: datetime
+    batch_id: int = Field(
+        description="The single submitted receipt batch this report is derived from"
+    )
+    watermark_seq: int = Field(
+        description="Highest sample seq selected; later-imported samples are never "
+        "part of this report"
+    )
+    total_samples: int
+    covered_samples: int
+    all_covered: bool
+    is_stale: bool = Field(
+        description="A newer receipt batch inserted data after this report was "
+        "created; the stored conclusions remain available but may be outdated"
+    )
+    stale_at: Optional[datetime]
+
+
+class CoverageReport(CoverageReportSummary):
+    items: list[CoverageReportItem]
+
+
+class CoverageReportRequest(BaseModel):
+    sample_ids: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            f"Up to {MAX_REPORT_SAMPLES} already-imported sample_ids to verify. "
+            "Omit to verify the most recently imported samples (still capped "
+            f"at {MAX_REPORT_SAMPLES})."
+        ),
+    )
+
+
+_COVERAGE_REPORT_BODY = {
+    "requestBody": {
+        "required": False,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sample_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": MAX_REPORT_SAMPLES,
+                        }
+                    },
+                },
+                "example": {"sample_ids": ["s1", "s2"]},
+            },
+            "application/x-www-form-urlencoded": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sample_ids": {
+                            "type": "string",
+                            "description": "comma- or newline-separated sample ids",
+                        }
+                    },
+                }
+            },
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "sample_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "one field per sample id",
+                        }
+                    },
+                }
+            },
+        },
+    }
+}
+
+
 def _utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -102,7 +219,9 @@ app = FastAPI(
         "at prediction time, so late-arriving corrections never leak the "
         "future into training data. Upload payment-revision CSVs and "
         "prediction-sample CSVs, then create a training run and download the "
-        "feature dataset once the run is complete."
+        "feature dataset once the run is complete. Coverage-receipt CSVs can "
+        "be imported and verified against samples so missing payment data is "
+        "never mistaken for zero payments."
     ),
     lifespan=lifespan,
 )
@@ -234,6 +353,265 @@ async def upload_sample_batch(request: Request):
         rows_inserted=inserted,
         rows_reused=reused,
     )
+
+
+# ---------------------------------------------------------------- receipts
+
+
+@app.post(
+    "/coverage-receipt-batches",
+    status_code=201,
+    response_model=CoverageBatchResult,
+    summary="Import a coverage-receipt CSV batch",
+    description=(
+        "Columns: `receipt_id,revision_id,account_id,covered_from_utc,"
+        "covered_to_utc,revoked`. A receipt asserts that an account's payment "
+        "data is complete on `[covered_from_utc, covered_to_utc)`. Within one "
+        "`receipt_id` the highest `revision_id` wins; corrections may move the "
+        "account or interval, and `revoked=true` cancels the receipt. "
+        "Idempotent per (receipt_id, revision_id): identical re-upload is "
+        "reused, different content rejects the ENTIRE batch (409). If the "
+        "batch inserts a new receipt revision, existing coverage reports are "
+        "marked stale (their stored conclusions stay readable)."
+    ),
+    openapi_extra=_UPLOAD_OPENAPI_EXTRA,
+)
+async def upload_coverage_batch(request: Request):
+    text = await _read_csv_body(request)
+    try:
+        rows, in_file_dups = parse_coverage_csv(text)
+    except CsvError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    pool = get_pool(request)
+    try:
+        with pool.connection() as conn:
+            batch_id, inserted, reused, stale = import_coverage_batch(
+                conn, rows, in_file_dups
+            )
+    except ConflictError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "conflicts": exc.conflicts[:20]},
+        )
+    return CoverageBatchResult(
+        batch_id=batch_id,
+        rows_total=len(rows) + in_file_dups,
+        rows_inserted=inserted,
+        rows_reused=reused,
+        reports_marked_stale=stale,
+    )
+
+
+def _split_form_ids(value: str) -> list[str]:
+    return [part.strip() for part in value.replace("\n", ",").split(",") if part.strip()]
+
+
+@app.post(
+    "/coverage-reports",
+    status_code=201,
+    response_model=CoverageReport,
+    summary="Verify sample coverage against committed receipts",
+    description=(
+        "Selects up to 200 already-imported samples (explicit `sample_ids`, or "
+        "the most recently imported samples when omitted) and records for each "
+        "whether `[prediction_at_utc - 24h, prediction_at_utc)` is fully "
+        "covered by that account's receipts, plus every uncovered UTC "
+        "sub-interval. A report is derived from exactly one submitted receipt "
+        "batch, so a concurrent upload can never be half-included. Creation is "
+        "atomic: on failure no partial report is stored."
+    ),
+    openapi_extra=_COVERAGE_REPORT_BODY,
+)
+async def create_coverage_report(request: Request):
+    sample_ids: Optional[list[str]] = None
+    ctype = request.headers.get("content-type", "")
+    if ctype.startswith("application/json"):
+        raw = await request.body()
+        if raw.strip():
+            try:
+                payload = CoverageReportRequest.model_validate_json(raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            sample_ids = payload.sample_ids
+    elif ctype.startswith("application/x-www-form-urlencoded"):
+        form = await request.form()
+        value = form.get("sample_ids")
+        if value is not None:
+            sample_ids = _split_form_ids(str(value))
+    elif ctype.startswith("multipart/form-data"):
+        form = await request.form()
+        sample_ids = []
+        for value in form.getlist("sample_ids"):
+            sample_ids.extend(_split_form_ids(str(value)))
+        if not sample_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="multipart form must contain 'sample_ids' field(s)",
+            )
+    elif (await request.body()).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="send JSON {\"sample_ids\": [...]}, a form field, or an empty "
+            "body to verify the most recently imported samples",
+        )
+    if sample_ids is not None and len(sample_ids) > MAX_REPORT_SAMPLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"at most {MAX_REPORT_SAMPLES} samples may be verified per "
+            f"report (got {len(sample_ids)})",
+        )
+    pool = get_pool(request)
+    try:
+        with pool.connection() as conn:
+            report = create_report(conn, sample_ids)
+            items = report_items(conn, report["report_id"])
+    except MissingSamplesError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "missing_sample_ids": exc.missing[:200]},
+        )
+    except NoReceiptsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except NoSamplesError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except CoverageRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _report_payload(report, items)
+
+
+def _report_payload(report: dict[str, Any], items: list[dict[str, Any]]) -> dict:
+    return {
+        "report_id": report["report_id"],
+        "created_at": report["created_at"],
+        "batch_id": report["batch_id"],
+        "watermark_seq": report["watermark_seq"],
+        "total_samples": report["total_samples"],
+        "covered_samples": report.get(
+            "covered_samples", sum(1 for item in items if item["fully_covered"])
+        ),
+        "all_covered": report["all_covered"],
+        "is_stale": report.get("is_stale", False),
+        "stale_at": report.get("stale_at"),
+        "items": items,
+    }
+
+
+@app.get(
+    "/coverage-reports",
+    response_model=list[CoverageReportSummary],
+    summary="List coverage reports (stale ones included)",
+)
+def list_coverage_reports(request: Request):
+    pool = get_pool(request)
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.report_id, r.created_at, r.batch_id, r.watermark_seq,
+                   r.total_samples, r.all_covered, r.stale_at,
+                   (SELECT count(*) FROM coverage_report_items i
+                    WHERE i.report_id = r.report_id AND i.fully_covered)
+            FROM coverage_reports r ORDER BY r.report_id
+            """
+        ).fetchall()
+    return [report_summary(r[:7], r[7]) for r in rows]
+
+
+@app.get(
+    "/coverage-reports/{report_id}",
+    response_model=CoverageReport,
+    summary="Get a stored coverage report, including stale ones",
+    description=(
+        "Stale reports remain readable: `is_stale`/`stale_at` flag that newer "
+        "receipts were imported after creation, while the original per-sample "
+        "conclusions are returned unchanged."
+    ),
+)
+def get_coverage_report(report_id: int, request: Request):
+    pool = get_pool(request)
+    with pool.connection() as conn:
+        row = report_row(conn, report_id)
+        if not row:
+            raise HTTPException(
+                status_code=404, detail=f"coverage report {report_id} not found"
+            )
+        covered = covered_count(conn, report_id)
+        items = report_items(conn, report_id)
+    return _report_payload(report_summary(row, covered), items)
+
+
+@app.get(
+    "/coverage-reports/{report_id}/report.csv",
+    summary="Download a coverage report as CSV",
+    description="One row per sample; uncovered intervals in `uncovered_ranges`.",
+)
+def download_coverage_report(report_id: int, request: Request):
+    pool = get_pool(request)
+    with pool.connection() as conn:
+        row = report_row(conn, report_id)
+        if not row:
+            raise HTTPException(
+                status_code=404, detail=f"coverage report {report_id} not found"
+            )
+        items = report_items(conn, report_id)
+        summary = report_summary(row, covered_count(conn, report_id))
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(
+        [
+            "sample_id",
+            "account_id",
+            "prediction_at_utc",
+            "window_from_utc",
+            "window_to_utc",
+            "fully_covered",
+            "uncovered_ranges",
+        ]
+    )
+    for item in items:
+        writer.writerow(
+            [
+                item["sample_id"],
+                item["account_id"],
+                _utc(item["prediction_at_utc"]),
+                _utc(item["window_from_utc"]),
+                _utc(item["window_to_utc"]),
+                "true" if item["fully_covered"] else "false",
+                "; ".join(
+                    f"[{_utc(rng['from_utc'])},{_utc(rng['to_utc'])})"
+                    for rng in item["uncovered_ranges"]
+                ),
+            ]
+        )
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="coverage_report_{report_id}.csv"',
+            "X-Coverage-Report-Stale": "true" if summary["is_stale"] else "false",
+        },
+    )
+
+
+@app.get(
+    "/coverage-receipt-batches", summary="List imported coverage-receipt batches"
+)
+def list_coverage_batches(request: Request):
+    pool = get_pool(request)
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT batch_id, received_at, rows_total, rows_inserted, rows_reused "
+            "FROM coverage_batches ORDER BY batch_id"
+        ).fetchall()
+    return [
+        {
+            "batch_id": r[0],
+            "received_at": _utc(r[1]),
+            "rows_total": r[2],
+            "rows_inserted": r[3],
+            "rows_reused": r[4],
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------- runs
@@ -448,6 +826,10 @@ def stats(request: Request):
             "sample_batches",
             "training_runs",
             "run_results",
+            "coverage_receipts",
+            "coverage_batches",
+            "coverage_reports",
+            "coverage_report_items",
         ):
             out[table] = conn.execute(
                 f"SELECT count(*) FROM {table}"  # noqa: S608 - fixed names
@@ -471,6 +853,12 @@ def root():
         "endpoints": [
             "POST /payment-revision-batches",
             "POST /sample-batches",
+            "POST /coverage-receipt-batches",
+            "POST /coverage-reports",
+            "GET /coverage-reports",
+            "GET /coverage-reports/{report_id}",
+            "GET /coverage-reports/{report_id}/report.csv",
+            "GET /coverage-receipt-batches",
             "POST /training-runs",
             "GET /training-runs",
             "GET /training-runs/{run_id}",

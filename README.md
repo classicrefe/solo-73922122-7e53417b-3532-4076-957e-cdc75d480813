@@ -29,6 +29,7 @@ bash examples/01_late_corrections.sh     # 迟到更正 / 撤销 / 改账户 / �
 bash examples/02_concurrent_uploads.sh   # 运行中并发补传 + 幂等复用 + 整批拒绝
 RUN_CHUNK_DELAY_MS=100 docker compose up -d   # 放慢 worker 便于观察
 bash examples/03_restart_resume.sh       # 重启接续
+bash examples/04_coverage_receipts.sh    # 覆盖回执 / 未覆盖区间 / 报告过期
 ```
 
 ## CSV 格式
@@ -54,10 +55,32 @@ s1,acct-A,2026-11-15T12:00:00Z
 
 上传方式：原始请求体（`Content-Type: text/csv`，`curl --data-binary @file.csv`）或 multipart 表单 `file` 字段。单文件上限默认 64MB（`MAX_CSV_BYTES`）。
 
+**渠道覆盖回执**（`POST /coverage-receipt-batches`）：
+
+```csv
+receipt_id,revision_id,account_id,covered_from_utc,covered_to_utc,revoked
+rcpt-1,1,acct-A,2026-11-14T00:00:00Z,2026-11-16T00:00:00Z,false
+```
+
+- 一条回执声明：某账户（某渠道）在 `[covered_from_utc, covered_to_utc)` 内的支付数据**已交齐**，`to` 取开区间、必须严格晚于 `from`。
+- 同一 `receipt_id` 以**最高 `revision_id`** 为准。更正可改账户、改时段；`revoked=true` 撤销该回执（覆盖作废，**不回退**到旧修订）。
+- 时间戳同样必须带时区，统一归一化为 UTC。
+
+## 覆盖核验（`POST /coverage-reports`）
+
+数据员在生成训练集前，先用覆盖回执核验样本：
+
+- 选择**最多 200 个已导入样本**（JSON `{"sample_ids": [...]}`，或表单字段 `sample_ids=s1,s2` 逗号/换行分隔；省略则取最近导入的样本，仍以 200 为上限）。不存在的 `sample_id` 或不存在的样本 → 422，且不落任何报告。
+- 核验窗口固定为 `[prediction_at_utc - 24h, prediction_at_utc)`；按样本账户取各回执**最高修订**（未撤销）的并集，判断是否完整覆盖，并记录每个**未覆盖的 UTC 子区间**，便于追查缺失时段。
+- 报告只依据**一组已提交回执**：回执导入与报告创建通过 advisory lock 串行化，报告固定引用其创建时最新提交的 `batch_id`，并发补传不会以半批形式混入。
+- **过期语义**：若之后有批次真正插入了新的回执修订，此前报告的 `is_stale=true` / `stale_at` 被置位，但原结论（`items`、`all_covered`）照常可查、可导出；重复导入完全相同内容（`rows_inserted=0`）**不会**使报告过期。
+- **原子性**：报告及其逐样本明细在同一事务内写入，核验失败不留半份报告；报告持久化在库中，重启后状态不变。
+- 查询：`GET /coverage-reports`（列表，含过期标记）、`GET /coverage-reports/{id}`（含明细）、`GET /coverage-reports/{id}/report.csv`（CSV，响应头 `X-Coverage-Report-Stale` 标识过期）。
+
 ## 幂等与冲突
 
-- **同号同修订同内容 → 复用**：重复上传完全相同的内容是幂等的（响应中 `rows_reused` 计数）。
-- **同号异内容 → 整批拒绝**：`(payment_id, revision_id)`（或 `sample_id`）已存在且内容不同，则**整个批次回滚**（HTTP 409，响应列出冲突键），批内其他新行也不会落库。样本的幂等规则与修订一致。
+- **同号同修订同内容 → 复用**：重复上传完全相同的内容是幂等的（响应中 `rows_reused` 计数）。回执的 `(receipt_id, revision_id)` 规则相同。
+- **同号异内容 → 整批拒绝**：`(payment_id, revision_id)`、`sample_id` 或 `(receipt_id, revision_id)` 已存在且内容不同，则**整个批次回滚**（HTTP 409，响应列出冲突键），批内其他新行也不会落库。
 - 文件内重复行：内容相同则去重，内容冲突则整批 400。
 
 ## 训练集生成语义
@@ -75,6 +98,11 @@ s1,acct-A,2026-11-15T12:00:00Z
 |---|---|---|
 | POST | `/payment-revision-batches` | 导入支付修订 CSV（201 / 400 格式错 / 409 内容冲突） |
 | POST | `/sample-batches` | 导入预测样本 CSV（同上） |
+| POST | `/coverage-receipt-batches` | 导入覆盖回执 CSV（同上；插入新修订会使已有报告过期） |
+| POST | `/coverage-reports` | 核验最多 200 个样本的覆盖情况（201 / 409 无回执 / 422 样本非法） |
+| GET | `/coverage-reports` / `/coverage-reports/{id}` | 报告列表 / 报告明细（含过期标记，过期仍可查看） |
+| GET | `/coverage-reports/{id}/report.csv` | 导出报告 CSV |
+| GET | `/coverage-receipt-batches` | 回执批次审计列表 |
 | POST | `/training-runs` | 创建训练运行（201 / 409 已有活动运行） |
 | GET | `/training-runs` / `/training-runs/{id}` | 运行状态与进度 |
 | GET | `/training-runs/{id}/dataset.csv` | 下载特征数据集（完成前 409） |
@@ -101,8 +129,8 @@ TEST_ADMIN_URL=postgresql://app@127.0.0.1:5544/postgres \
     pytest tests/ -q
 ```
 
-- `tests/test_csvio.py`：CSV 解析/校验单元测试（无需服务）。
-- `tests/test_e2e.py`：真实 PostgreSQL 上的端到端测试——窗口与可见性边界、撤销语义、账户/时刻更正、幂等复用、整批拒绝、水位线隔离、下载门槛、优雅重启与崩溃接续。
+- `tests/test_csvio.py`：CSV 解析/校验单元测试与覆盖区间求补逻辑（无需服务）。
+- `tests/test_e2e.py`：真实 PostgreSQL 上的端到端测试——窗口与可见性边界、撤销语义、账户/时刻更正、幂等复用、整批拒绝、水位线隔离、下载门槛、优雅重启与崩溃接续；以及覆盖回执的修订/撤销/改账户、未覆盖区间、报告单批隔离、过期与重复导入不变、非法请求不落半份报告、重启后报告仍可读。
 
 ## 设计说明与限制
 
@@ -110,3 +138,5 @@ TEST_ADMIN_URL=postgresql://app@127.0.0.1:5544/postgres \
 - **结果固化**：样本在某次运行中计算后即固化；运行中途到达的"回填过去可见时间"的修订只影响尚未计算的样本（这是"不持快照"设计的固有取舍）。如需重算，用新 `sample_id` 提交样本并创建新运行。
 - **规模**：每样本一次 as-of 查询（`visible_at` 索引 + 主键）；百万级修订、十万级样本量级可正常工作。更大规模可考虑分区与物化中间层，未实现。
 - 上传解析为整文件内存处理（64MB 上限内）。
+- **覆盖报告为时点快照**：报告保存的是创建时各回执最高修订的核验结论；后续回执更正只使其 `is_stale`，不会自动重算。需要最新结论时重新创建报告。
+- **过期是全局的**：任何插入新回执修订的批次都会使全部既有报告过期（简单、保守）；不影响原结论的查看与导出。

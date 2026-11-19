@@ -1,0 +1,4 @@
+receipt_id,revision_id,account_id,covered_from_utc,covered_to_utc,revoked
+crc-1,1,acct-A,2026-11-14T00:00:00Z,2026-11-15T09:00:00Z,false
+crc-2,1,acct-A,2026-11-15T10:00:00Z,2026-11-15T12:00:00Z,false
+crc-3,1,acct-B,2026-11-14T00:00:00Z,2026-11-16T00:00:00Z,false

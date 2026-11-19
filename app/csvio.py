@@ -19,6 +19,19 @@ REVISION_COLUMNS = [
 
 SAMPLE_COLUMNS = ["sample_id", "account_id", "prediction_at_utc"]
 
+# Coverage receipt: one row per (receipt_id, revision_id). A higher
+# revision of the same receipt supersedes lower ones; a revision with
+# revoked=true cancels the receipt's coverage entirely. Corrections may
+# move account_id / the covered UTC interval.
+COVERAGE_COLUMNS = [
+    "receipt_id",
+    "revision_id",
+    "account_id",
+    "covered_from_utc",
+    "covered_to_utc",
+    "revoked",
+]
+
 _TRUE_VALUES = {"true", "t", "1", "yes", "y"}
 _FALSE_VALUES = {"false", "f", "0", "no", "n"}
 _INT64_MIN = -(2**63)
@@ -57,6 +70,24 @@ class SampleRow:
 
     def content(self) -> tuple:
         return (self.account_id, self.prediction_at)
+
+
+@dataclass(frozen=True)
+class CoverageRow:
+    receipt_id: str
+    revision_id: int
+    account_id: str
+    covered_from: datetime
+    covered_to: datetime
+    revoked: bool
+
+    def content(self) -> tuple:
+        return (
+            self.account_id,
+            self.covered_from,
+            self.covered_to,
+            self.revoked,
+        )
 
 
 def _parse_int(value: str, field: str, line: int) -> int:
@@ -186,5 +217,57 @@ def parse_sample_csv(text: str) -> tuple[list[SampleRow], int]:
             in_file_dups += 1
             continue
         seen[row.sample_id] = row
+        rows.append(row)
+    return rows, in_file_dups
+
+
+def parse_coverage_csv(text: str) -> tuple[list[CoverageRow], int]:
+    """Parse a coverage-receipt CSV.
+
+    Same in-file dedupe rules as revisions: keyed by (receipt_id,
+    revision_id); identical duplicates collapse, conflicting duplicates
+    reject the whole file. ``covered_from_utc`` must be strictly before
+    ``covered_to_utc``.
+    """
+    reader = _reader(text, COVERAGE_COLUMNS)
+    rows: list[CoverageRow] = []
+    seen: dict[tuple[str, int], CoverageRow] = {}
+    in_file_dups = 0
+    for raw in reader:
+        line = reader.line_num
+        receipt_id = _parse_text(raw.get("receipt_id"), "receipt_id", line)
+        revision_id = _parse_int(raw.get("revision_id", ""), "revision_id", line)
+        if revision_id < 0:
+            raise CsvError(f"line {line}: field 'revision_id' must be >= 0")
+        covered_from = _parse_ts(
+            raw.get("covered_from_utc", ""), "covered_from_utc", line
+        )
+        covered_to = _parse_ts(raw.get("covered_to_utc", ""), "covered_to_utc", line)
+        if covered_from >= covered_to:
+            raise CsvError(
+                f"line {line}: covered_from_utc must be strictly before "
+                f"covered_to_utc (got {covered_from.isoformat()} .. "
+                f"{covered_to.isoformat()})"
+            )
+        row = CoverageRow(
+            receipt_id=receipt_id,
+            revision_id=revision_id,
+            account_id=_parse_text(raw.get("account_id"), "account_id", line),
+            covered_from=covered_from,
+            covered_to=covered_to,
+            revoked=_parse_bool(raw.get("revoked", ""), "revoked", line),
+        )
+        key = (row.receipt_id, row.revision_id)
+        prev = seen.get(key)
+        if prev is not None:
+            if prev.content() != row.content():
+                raise CsvError(
+                    f"line {line}: conflicting duplicate for "
+                    f"receipt_id={receipt_id!r} revision_id={revision_id} "
+                    f"within this file"
+                )
+            in_file_dups += 1
+            continue
+        seen[key] = row
         rows.append(row)
     return rows, in_file_dups

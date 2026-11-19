@@ -1,0 +1,2 @@
+receipt_id,revision_id,account_id,covered_from_utc,covered_to_utc,revoked
+crc-2,2,acct-A,2026-11-15T10:00:00Z,2026-11-15T12:00:00Z,true

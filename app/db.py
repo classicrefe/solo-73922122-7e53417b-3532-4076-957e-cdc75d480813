@@ -76,6 +76,60 @@ CREATE TABLE IF NOT EXISTS run_results (
     computed_at    timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, sample_seq)
 );
+
+-- ------------------------------------------------------ coverage receipts
+-- A receipt asserts "account X's payment data is complete on [from, to)".
+-- Revisions of one receipt supersede each other; a revoked revision
+-- cancels the receipt. Each imported batch is a submission; a report is
+-- built from exactly one submitted batch (never a mix of concurrent ones).
+CREATE TABLE IF NOT EXISTS coverage_receipts (
+    receipt_id     text        NOT NULL,
+    revision_id    integer     NOT NULL,
+    account_id     text        NOT NULL,
+    covered_from   timestamptz NOT NULL,
+    covered_to     timestamptz NOT NULL,
+    revoked        boolean     NOT NULL,
+    batch_id       bigint      NOT NULL,
+    imported_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (receipt_id, revision_id),
+    CHECK (covered_from < covered_to)
+);
+CREATE INDEX IF NOT EXISTS ix_coverage_receipts_account
+    ON coverage_receipts (account_id, covered_from, covered_to);
+
+CREATE TABLE IF NOT EXISTS coverage_batches (
+    batch_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    received_at   timestamptz NOT NULL DEFAULT now(),
+    rows_total    integer NOT NULL,
+    rows_inserted integer NOT NULL,
+    rows_reused   integer NOT NULL
+);
+
+-- One verification report. batch_id pins the exact submitted receipt
+-- batch the report was derived from; watermark_seq caps the samples to
+-- those accepted by report creation time. Both are frozen at creation.
+CREATE TABLE IF NOT EXISTS coverage_reports (
+    report_id     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    batch_id      bigint NOT NULL REFERENCES coverage_batches(batch_id),
+    watermark_seq bigint NOT NULL,
+    total_samples integer NOT NULL,
+    all_covered   boolean NOT NULL,
+    stale_at      timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS coverage_report_items (
+    report_id         bigint NOT NULL REFERENCES coverage_reports(report_id),
+    sample_seq        bigint NOT NULL REFERENCES samples(seq),
+    sample_id         text NOT NULL,
+    account_id        text NOT NULL,
+    prediction_at     timestamptz NOT NULL,
+    from_utc          timestamptz NOT NULL,
+    to_utc            timestamptz NOT NULL,
+    fully_covered     boolean NOT NULL,
+    uncovered_ranges  jsonb NOT NULL,
+    PRIMARY KEY (report_id, sample_seq)
+);
 """
 
 

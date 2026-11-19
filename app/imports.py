@@ -14,13 +14,19 @@ from typing import Any
 
 from psycopg import Connection
 
-from .csvio import RevisionRow, SampleRow
+from .csvio import CoverageRow, RevisionRow, SampleRow
 
 # Advisory lock key serializing "sample batch acceptance" against
 # "training run creation" so a run's watermark is an exact acceptance
 # instant: every batch committed before the lock is included, every batch
 # after it is not.
 ACCEPTANCE_LOCK_KEY = 730001
+
+# Advisory lock key serializing "coverage-receipt batch import" against
+# "coverage-report creation". A report therefore sees exactly the receipt
+# batches committed before it was created — never a half-applied concurrent
+# upload — and any later inserting batch can mark it stale without racing it.
+COVERAGE_LOCK_KEY = 730002
 
 
 class ConflictError(Exception):
@@ -185,3 +191,101 @@ def import_sample_batch(
         (inserted, reused, batch_id),
     )
     return batch_id, inserted, reused
+
+
+def import_coverage_batch(
+    conn: Connection, rows: list[CoverageRow], in_file_dups: int
+) -> tuple[int, int, int, int]:
+    """Insert one coverage-receipt batch.
+
+    Returns (batch_id, inserted, reused, reports_marked_stale).
+
+    Same idempotency contract as the other imports: a re-uploaded
+    (receipt_id, revision_id) with identical content is reused; different
+    content rejects the entire batch with ConflictError.
+
+    Takes the coverage advisory lock. If the batch inserts at least one new
+    receipt revision, every existing coverage report is marked stale — its
+    original conclusions stay stored and readable. A batch that inserts
+    nothing (pure idempotent re-import) never stales reports.
+    """
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (COVERAGE_LOCK_KEY,))
+    batch_id = conn.execute(
+        """
+        INSERT INTO coverage_batches (rows_total, rows_inserted, rows_reused)
+        VALUES (%s, 0, 0)
+        RETURNING batch_id
+        """,
+        (len(rows) + in_file_dups,),
+    ).fetchone()[0]
+    inserted = 0
+    reused = in_file_dups
+    conflicts: list[dict[str, Any]] = []
+    for r in rows:
+        got = conn.execute(
+            """
+            INSERT INTO coverage_receipts
+                (receipt_id, revision_id, account_id, covered_from, covered_to,
+                 revoked, batch_id)
+            VALUES (%(receipt_id)s, %(revision_id)s, %(account_id)s,
+                    %(covered_from)s, %(covered_to)s, %(revoked)s, %(batch_id)s)
+            ON CONFLICT (receipt_id, revision_id) DO NOTHING
+            RETURNING receipt_id
+            """,
+            {
+                "receipt_id": r.receipt_id,
+                "revision_id": r.revision_id,
+                "account_id": r.account_id,
+                "covered_from": r.covered_from,
+                "covered_to": r.covered_to,
+                "revoked": r.revoked,
+                "batch_id": batch_id,
+            },
+        ).fetchone()
+        if got:
+            inserted += 1
+            continue
+        existing = conn.execute(
+            """
+            SELECT account_id, covered_from, covered_to, revoked
+            FROM coverage_receipts
+            WHERE receipt_id = %s AND revision_id = %s
+            """,
+            (r.receipt_id, r.revision_id),
+        ).fetchone()
+        if existing and tuple(existing) == r.content():
+            reused += 1
+        else:
+            conflicts.append(
+                {
+                    "key": f"{r.receipt_id}#{r.revision_id}",
+                    "existing": {
+                        "account_id": existing[0],
+                        "covered_from_utc": _ts(existing[1]),
+                        "covered_to_utc": _ts(existing[2]),
+                        "revoked": existing[3],
+                    }
+                    if existing
+                    else None,
+                    "incoming": {
+                        "account_id": r.account_id,
+                        "covered_from_utc": _ts(r.covered_from),
+                        "covered_to_utc": _ts(r.covered_to),
+                        "revoked": r.revoked,
+                    },
+                }
+            )
+    if conflicts:
+        raise ConflictError(conflicts)
+    conn.execute(
+        "UPDATE coverage_batches SET rows_inserted = %s, rows_reused = %s "
+        "WHERE batch_id = %s",
+        (inserted, reused, batch_id),
+    )
+    if inserted:
+        stale = conn.execute(
+            "UPDATE coverage_reports SET stale_at = now() WHERE stale_at IS NULL"
+        ).rowcount
+    else:
+        stale = 0
+    return batch_id, inserted, reused, stale
